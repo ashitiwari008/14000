@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<link rel="manifest" href="manifest.webmanifest">
+<title>NH-29 GPS Map Camera</title>
+<style>
+*{box-sizing:border-box} body{margin:0;background:#f3f4f6;color:#111827;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}
+.app{max-width:720px;margin:auto;padding:14px} .hero{background:#111827;color:white;border-radius:16px;padding:16px;margin-bottom:12px}
+.card{background:white;border-radius:16px;padding:14px;margin-bottom:12px;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+button,input{font:inherit} button{width:100%;border:0;border-radius:12px;padding:13px;margin-top:9px;font-weight:800}
+.green{background:#16a34a;color:#fff} .dark{background:#111827;color:#fff} .gray{background:#e5e7eb;color:#111827}
+.small{font-size:13px;color:#6b7280;line-height:1.45;margin-top:8px} .status{padding:10px;border-radius:10px;background:#ecfdf5;color:#065f46;font-weight:700;font-size:13px;margin-top:9px}
+#output{width:100%;display:none;border-radius:12px;margin-top:10px} #source{width:100%;display:none}
+.badge{display:inline-block;background:#e5e7eb;padding:5px 8px;border-radius:8px;font-size:11px;font-weight:900}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+<div class="app">
+  <div class="hero"><b>📷 NH-29 GPS Map Camera</b><div style="font-size:13px;opacity:.82;margin-top:5px">Photo → GPS → KML Chainage → Village → GPS Photo</div></div>
+
+  <div class="card">
+    <span class="badge">STEP 1 — PHOTO</span>
+    <input id="photo" type="file" accept="image/*" capture="environment" style="width:100%;margin-top:10px">
+    <div class="small">iPhone Camera/Photos से photo चुनें। Tool photo GPS (EXIF) पहले पढ़ेगा; नहीं मिलने पर iPhone GPS मांगेगा.</div>
+    <div id="status" class="status">Photo चुनें.</div>
+  </div>
+
+  <div class="card">
+    <span class="badge">STEP 2 — KML / KMZ</span>
+    <input id="route" type="file" accept=".kml,.kmz,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz" style="width:100%;margin-top:10px">
+    <div class="small">Apni KML/KMZ route file ek baar select करें। Photo लेते समय current live GPS से nearest KML chainage automatically मिलेगा.</div>
+    <div id="routeStatus" class="status">KML/KMZ select करें.</div>
+  </div>
+
+  <div class="card">
+    <span class="badge">STEP 3 — AUTOMATIC DETAILS</span>
+    <div id="details" class="small">Manual Latitude / Longitude / Chainage / Village की जरूरत नहीं.</div>
+  </div>
+
+  <div class="card">
+    <span class="badge">STEP 4 — GPS PHOTO</span>
+    <button id="startGPS" type="button">📍 Start LIVE GPS</button>
+<button id="make" class="green" type="button" disabled>📸 GPS Photo तैयार करें</button>
+    <button id="save" class="dark" type="button" disabled>💾 Save / Share Photo</button>
+    <button id="open" class="gray" type="button" disabled>🖼️ Open Final Photo</button>
+    <img id="output" alt="GPS photo">
+    <div class="small">iPhone में Save/Share दबाएँ और Share Sheet में <b>Save Image</b> चुनें। अगर option न दिखे तो Open Final Photo करके image को long-press → Save to Photos करें.</div>
+  </div>
+</div>
+<canvas id="canvas" style="display:none"></canvas>
+<script>
+let selected=null,gps=null,finalBlob=null,finalUrl=null,routePoints=[];
+const $=id=>document.getElementById(id);
+function valid(a,b){return Number.isFinite(a)&&Number.isFinite(b)&&a>=-90&&a<=90&&b>=-180&&b<=180}
+function hav(a,b,c,d){const R=6371000,p=Math.PI/180,la1=a*p,la2=c*p,dl=(c-a)*p,do_=(d-b)*p;const q=Math.sin(dl/2)**2+Math.cos(la1)*Math.cos(la2)*Math.sin(do_/2)**2;return 2*R*Math.asin(Math.sqrt(q));}
+function parseChainageText(t){
+  if(!t)return null;
+  const m=t.replace(/,/g,' ').match(/(?:Ch(?:ainage)?[.\s:]*)?(\d+)\s*\+\s*(\d{1,3})/i);
+  return m ? Number(m[1])*1000+Number(m[2]) : null;
+}
+function parseCoords(text){
+  const out=[];
+  for(const raw of text.trim().split(/\s+/)){
+    const a=raw.split(','); if(a.length<2)continue;
+    const lon=Number(a[0]),lat=Number(a[1]); if(valid(lat,lon)) out.push({lat,lon});
+  }
+  return out;
+}
+function parseKML(xml){
+  const doc=new DOMParser().parseFromString(xml,'application/xml');
+  if(doc.querySelector('parsererror')) throw new Error('KML XML invalid');
+  const pts=[];
+  for(const pm of [...doc.getElementsByTagName('Placemark')]){
+    const name=(pm.getElementsByTagName('name')[0]?.textContent||'').trim();
+    const desc=(pm.getElementsByTagName('description')[0]?.textContent||'').replace(/<[^>]*>/g,' ');
+    const ch=parseChainageText(name)||parseChainageText(desc);
+    const cs=pm.getElementsByTagName('coordinates');
+    for(const c of cs){
+      const arr=parseCoords(c.textContent||'');
+      arr.forEach(q=>pts.push({...q,chain:ch}));
+    }
+  }
+  if(!pts.length) throw new Error('KML में coordinates नहीं मिले');
+  // If a single route LineString has a start chainage, assign chainage by cumulative distance.
+  let lastCh=pts.find(p=>p.chain!=null)?.chain;
+  if(lastCh==null) lastCh=0;
+  let dist=0;
+  for(let i=0;i<pts.length;i++){
+    if(i>0) dist+=hav(pts[i-1].lat,pts[i-1].lon,pts[i].lat,pts[i].lon);
+    if(pts[i].chain==null) pts[i].chain=Math.round(lastCh+dist);
+    else {lastCh=pts[i].chain;dist=0;}
+  }
+  return pts;
+}
+async function readRoute(file){
+  if(!file) return;
+  try{
+    let xml='';
+    if(file.name.toLowerCase().endsWith('.kmz')){
+      if(!window.JSZip) throw new Error('KMZ reader load नहीं हुआ; internet ON करके फिर try करें.');
+      const z=await JSZip.loadAsync(file);
+      const k=Object.keys(z.files).find(n=>/\.kml$/i.test(n));
+      if(!k) throw new Error('KMZ के अंदर KML नहीं मिला');
+      xml=await z.files[k].async('text');
+    }else xml=await file.text();
+    routePoints=parseKML(xml);
+    $('routeStatus').textContent=`✅ KML/KMZ loaded: ${routePoints.length} route points`; locate();
+  }catch(e){routePoints=[];$('routeStatus').textContent='❌ '+e.message;}
+}
+function nearestRoute(lat,lon){
+  if(!routePoints.length)return null;
+  let best=null;
+  for(const p of routePoints){const d=hav(lat,lon,p.lat,p.lon);if(!best||d<best.d)best={...p,d}}
+  return best;
+}
+function chainage(n){
+  if(!n)return 'Ch. —';
+  const m=Math.max(0,Math.round(n.chain)); return 'Ch. '+Math.floor(m/1000)+'+'+String(m%1000).padStart(3,'0');
+}
+async function reverse(lat,lon){
+  try{
+    const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`,{headers:{Accept:'application/json'}});
+    const d=await r.json(),a=d.address||{};
+    const village=a.village||a.hamlet||a.town||a.city||a.municipality||a.suburb||a.neighbourhood||'';
+    const district=a.county||a.district||''; const state=a.state||'';
+    return {title:[village,district,state].filter(Boolean).join(', ')||'GPS Location',address:d.display_name||''};
+  }catch(e){return {title:'GPS Location',address:''}}
+}
+
+let gpsWatchId=null, gpsReady=false, lastGpsFixAt=0;
+
+function gpsErrorText(err){
+  if(!err) return 'Unknown GPS error';
+  if(err.code===1) return 'Location permission denied. iPhone Settings → Privacy & Security → Location Services → Safari → While Using the App.';
+  if(err.code===2) return 'Location unavailable. Move outdoors/near a window and try again.';
+  if(err.code===3) return 'GPS timeout. Please wait and try again.';
+  return err.message||'GPS error';
+}
+function stopGPSWatch(){
+  if(gpsWatchId!==null && navigator.geolocation){
+    navigator.geolocation.clearWatch(gpsWatchId);
+    gpsWatchId=null;
+  }
+}
+async function applyLiveFix(pos){
+  const c=pos.coords,lat=Number(c.latitude),lon=Number(c.longitude);
+  if(!Number.isFinite(lat)||!Number.isFinite(lon)) return;
+  const accuracy=Number.isFinite(c.accuracy)?c.accuracy:9999;
+  lastGpsFixAt=Date.now();
+  const n=nearestRoute(lat,lon);
+  const p={lat,lon,accuracy,heading:c.heading,speed:c.speed,source:'LIVE iPhone GPS',timestamp:pos.timestamp||Date.now()};
+  if(!n){
+    gps=p; gpsReady=true;
+    $('details').innerHTML=`<b>LIVE GPS:</b> ${lat.toFixed(6)}, ${lon.toFixed(6)} (±${Math.round(accuracy)} m)<br><b>KML:</b> Load KML/KMZ to calculate chainage.`;
+    $('status').textContent=`📍 LIVE GPS locked — ±${Math.round(accuracy)} m`;
+    $('make').disabled=!selected;
+    return;
+  }
+  const a=await reverse(lat,lon);
+  gps={...p,...n,chain:chainage(n),title:a.title,address:a.address};
+  gpsReady=true;
+  $('details').innerHTML=`<b>LIVE GPS:</b> ${lat.toFixed(6)}, ${lon.toFixed(6)} (±${Math.round(accuracy)} m)<br><b>Chainage:</b> ${gps.chain}<br><b>Village/Location:</b> ${a.title}<br><b>Address:</b> ${a.address||'—'}`;
+  $('status').textContent=`✅ LIVE GPS locked + KML matched — ±${Math.round(accuracy)} m`;
+  $('make').disabled=!selected;
+}
+function startLiveGPS(){
+  stopGPSWatch(); gpsReady=false;
+  if(!navigator.geolocation){$('status').textContent='❌ Geolocation is not available in this browser.';return;}
+  if(window.isSecureContext===false){$('status').textContent='❌ iPhone GPS requires HTTPS. Open this web app through an HTTPS address.';return;}
+  $('status').textContent='📍 Requesting iPhone LIVE GPS permission...';
+  gpsWatchId=navigator.geolocation.watchPosition(
+    pos=>{applyLiveFix(pos).catch(e=>$('status').textContent='❌ GPS processing error: '+(e.message||e));},
+    err=>{$('make').disabled=true;$('status').textContent='❌ '+gpsErrorText(err);},
+    {enableHighAccuracy:true,maximumAge:0,timeout:30000}
+  );
+}
+async function locate(){startLiveGPS();}
+if($('startGPS')) $('startGPS').addEventListener('click',startLiveGPS);
+
+
+$('route').addEventListener('change',e=>readRoute(e.target.files[0]));
+$('photo').addEventListener('change',e=>{
+ selected=e.target.files[0]||null;finalBlob=null;$('save').disabled=true;$('open').disabled=true;
+ if(selected){$('status').textContent='Photo selected. Waiting for LIVE GPS lock...';if(!gpsReady)startLiveGPS();else $('make').disabled=false;}
+ else $('make').disabled=true;
+});
+
+
+
+function drawMapFallback(ctx,x,y,w,h){
+  ctx.fillStyle='#dfe8d4';ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle='#f3c342';ctx.lineWidth=Math.max(5,w*.06);ctx.beginPath();
+  ctx.moveTo(x+w*.03,y+h*.93);ctx.bezierCurveTo(x+w*.30,y+h*.76,x+w*.55,y+h*.48,x+w*.97,y+h*.05);ctx.stroke();
+  const px=x+w/2,py=y+h/2,r=Math.max(7,w*.06);
+  ctx.fillStyle='#e53935';ctx.beginPath();ctx.arc(px,py,r,0,Math.PI*2);ctx.fill();
+}
+function tileXY(lat,lon,z){
+  const n=Math.pow(2,z), x=(lon+180)/360*n;
+  const r=lat*Math.PI/180;
+  const y=(1-Math.asinh(Math.tan(r))/Math.PI)/2*n;
+  return {x,y};
+}
+function loadTile(z,x,y){
+  const n=2**z; x=((x%n)+n)%n;
+  if(y<0||y>=n) return Promise.resolve(null);
+  return new Promise(resolve=>{
+    const im=new Image();
+    im.crossOrigin='anonymous';
+    im.onload=()=>resolve(im);
+    im.onerror=()=>resolve(null);
+    im.src=`https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+  });
+}
+async function drawMap(ctx,x,y,w,h,lat,lon){
+  // REAL LIVE ROAD MAP: OpenStreetMap tiles centered on the current iPhone GPS.
+  ctx.save();
+  ctx.fillStyle='#e5e5e5';ctx.fillRect(x,y,w,h);
+  const z=16, center=tileXY(lat,lon,z);
+  const tile=256, cols=Math.ceil(w/tile)+2, rows=Math.ceil(h/tile)+2;
+  const ox=Math.floor(cols/2), oy=Math.floor(rows/2);
+  const cx=ox*tile+w/2-(center.x-Math.floor(center.x))*tile;
+  const cy=oy*tile+h/2-(center.y-Math.floor(center.y))*tile;
+  const jobs=[];
+  for(let j=0;j<rows;j++)for(let i=0;i<cols;i++){
+    const tx=Math.floor(center.x)+(i-ox),ty=Math.floor(center.y)+(j-oy);
+    jobs.push(loadTile(z,tx,ty).then(im=>({im,i,j})));
+  }
+  const tiles=await Promise.all(jobs);
+  tiles.forEach(t=>{if(t.im)ctx.drawImage(t.im,cx+(t.i-ox)*tile,cy+(t.j-oy)*tile,tile,tile);});
+
+  // Draw KML route on top when available.
+  if(routePoints&&routePoints.length>1){
+    const n=2**z;
+    const proj=(p)=>{
+      const q=tileXY(p.lat,p.lon,z);
+      return {x:x+w/2+(q.x-center.x)*tile,y:y+h/2+(q.y-center.y)*tile};
+    };
+    ctx.strokeStyle='#1976d2';ctx.lineWidth=Math.max(2,w*.015);
+    ctx.globalAlpha=.88;ctx.beginPath();
+    let first=true;
+    routePoints.forEach(p=>{
+      const q=proj(p);
+      if(q.x<x-w||q.x>x+w*2||q.y<y-h||q.y>y+h*2)return;
+      if(first){ctx.moveTo(q.x,q.y);first=false}else ctx.lineTo(q.x,q.y);
+    });
+    ctx.stroke();ctx.globalAlpha=1;
+  }
+
+  // Current GPS marker, exactly at the center of the map.
+  const px=x+w/2,py=y+h/2,r=Math.max(7,w*.06);
+  ctx.fillStyle='rgba(25,118,210,.22)';ctx.beginPath();ctx.arc(px,py,r*2.3,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#e53935';ctx.beginPath();ctx.arc(px,py,r,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.moveTo(px-r*.72,py+r*.25);ctx.lineTo(px,py+r*2.0);ctx.lineTo(px+r*.72,py+r*.25);ctx.closePath();ctx.fill();
+  ctx.fillStyle='#1976d2';ctx.beginPath();ctx.arc(px,py,r*.34,0,Math.PI*2);ctx.fill();
+
+  // Small attribution.
+  ctx.fillStyle='rgba(255,255,255,.9)';
+  ctx.fillRect(x+2,y+h-16,Math.min(w*.62,125),14);
+  ctx.fillStyle='#555';ctx.font=`${Math.max(9,w*.035)}px Arial`;
+  ctx.fillText('© OpenStreetMap contributors',x+4,y+h-5);
+  ctx.restore();
+}
+
+$('make').addEventListener('click',async ()=>{
+ if(!selected||!gps){alert('GPS details तैयार नहीं हैं.');return}
+ $('status').textContent='⏳ LIVE GPS map + GPS photo तैयार हो रही है...';
+ const u=URL.createObjectURL(selected),img=new Image();
+ img.onload=()=>{
+  try{
+   const max=2400,s=Math.min(1,max/Math.max(img.naturalWidth,img.naturalHeight));
+   const w=Math.round(img.naturalWidth*s),h=Math.round(img.naturalHeight*s);
+   const c=$('canvas');c.width=w;c.height=h;const ctx=c.getContext('2d');ctx.drawImage(img,0,0,w,h);
+
+   // ===== MASTER LOCKED GEOMETRY (from supplied approved master) =====
+   const cardX=Math.round(w*.026);
+   const cardY=Math.round(h*.714);
+   const cardW=Math.round(w*.936);
+   const cardH=Math.round(h*.242);
+   const mapX=cardX+Math.round(w*.010);
+   const mapY=cardY+Math.round(h*.008);
+   const mapW=Math.round(w*.178);
+   const mapH=cardH-Math.round(h*.016);
+   const tx=cardX+Math.round(w*.198);
+   const right=cardX+cardW-Math.round(w*.018);
+
+   ctx.fillStyle='rgba(5,5,5,.84)';
+   ctx.roundRect(cardX,cardY,cardW,cardH,Math.round(w*.012));
+   ctx.fill();
+
+   try{await drawMap(ctx,mapX,mapY,mapW,mapH,gps.lat,gps.lon);}catch(mapErr){console.warn(mapErr);drawMapFallback(ctx,mapX,mapY,mapW,mapH);}
+
+   // Master text sizing/spacing — locked.
+   const title=Math.max(32,Math.round(w*.033));
+   const body=Math.max(23,Math.round(w*.023));
+   const chain=Math.max(27,Math.round(w*.027));
+   const small=Math.max(21,Math.round(w*.021));
+
+   ctx.textBaseline='top';
+   ctx.fillStyle='#ffd21a';
+   ctx.font=`900 ${title}px -apple-system,BlinkMacSystemFont,Arial,sans-serif`;
+   const titleText=(gps.title||'GPS Location')+' 🇮🇳';
+   ctx.fillText(titleText,tx,cardY+Math.round(h*.015));
+
+   ctx.fillStyle='#ffd21a';
+   ctx.font=`900 ${chain}px -apple-system,BlinkMacSystemFont,Arial,sans-serif`;
+   ctx.fillText(gps.chain||'Ch. —',tx,cardY+Math.round(h*.080));
+
+   ctx.fillStyle='#fff';
+   ctx.font=`500 ${body}px -apple-system,BlinkMacSystemFont,Arial,sans-serif`;
+   const addr=gps.address||gps.title||'GPS Location';
+   ctx.fillText(addr,tx,cardY+Math.round(h*.108));
+
+   ctx.font=`800 ${small}px -apple-system,BlinkMacSystemFont,Arial,sans-serif`;
+   ctx.fillText(`◉  Lat ${gps.lat.toFixed(6)}°`,tx,cardY+Math.round(h*.155));
+   ctx.fillText(`Long ${gps.lon.toFixed(6)}°`,tx+Math.round(w*.325),cardY+Math.round(h*.155));
+
+   const now=new Date();
+   const date=now.toLocaleDateString('en-GB');
+   const time=now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
+   ctx.font=`700 ${small}px -apple-system,BlinkMacSystemFont,Arial,sans-serif`;
+   ctx.fillText(`▣  ${date}`,tx,cardY+Math.round(h*.200));
+   ctx.fillText(`◷  ${time} PM (GMT+05:30)`,tx+Math.round(w*.325),cardY+Math.round(h*.200));
+
+   // Fixed master brand position
+   ctx.font=`800 ${small}px -apple-system,BlinkMacSystemFont,Arial,sans-serif`;
+   const brand='📷 GPS Map Camera';
+   ctx.fillText(brand,cardX+cardW-Math.round(w*.155),cardY+Math.round(h*.012));
+
+   // No Note line.
+   finalBlob=dataURLToBlob(c.toDataURL('image/jpeg',.94));
+   if(finalUrl)URL.revokeObjectURL(finalUrl);
+   finalUrl=URL.createObjectURL(finalBlob);
+   $('output').src=finalUrl;$('output').style.display='block';
+   $('save').disabled=false;$('open').disabled=false;
+   $('status').textContent='✅ Master-format GPS Photo तैयार है.';
+  }catch(e){$('status').textContent='❌ Photo generation error: '+e.message}
+  URL.revokeObjectURL(u);
+ };
+ img.onerror=()=>{URL.revokeObjectURL(u);$('status').textContent='❌ Photo read नहीं हुई.'};
+ img.src=u;
+});
+
+function dataURLToBlob(u){const p=u.split(','),m=p[0].match(/:(.*?);/)[1],b=atob(p[1]),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return new Blob([a],{type:m})}
+$('save').addEventListener('click',async()=>{
+ if(!finalBlob)return;
+ const f=new File([finalBlob],'GPS_Map_Camera_'+Date.now()+'.jpg',{type:'image/jpeg'});
+ if(navigator.canShare&&navigator.canShare({files:[f]})){
+  try{await navigator.share({files:[f],title:'GPS Map Camera Photo'});return}catch(e){if(e.name==='AbortError')return}
+ }
+ window.open(finalUrl,'_blank');
+});
+$('open').addEventListener('click',()=>{if(finalUrl)window.open(finalUrl,'_blank')});
+</script>
+</body>
+</html>
